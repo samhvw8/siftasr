@@ -5,8 +5,8 @@ description: What siftasr does, how tools in the workspace depend on it, and how
 tags: [onboarding, asr, diarization]
 status: stable
 generated:
-  by: samhv
-  at: '2026-10-17T13:30:00Z'
+  by: human:samhv
+  at: '2026-10-17T16:35:00Z'
 sources:
   - id: pyproject
     resource: pyproject.toml
@@ -24,3 +24,4 @@ sources:
 # Where to go next
 
 * [Routing and speaker attribution](/architecture/routing-and-speakers.md) - How language detection, per-language lanes, and turn/word speaker diarization work.
+* [Performance and speaker diarization](/decisions/performance-and-diarization.md) - Why siftasr uses compiled speculative TDT decoding, 150 s / 4 s in-memory chunking, and two-stage sparse anchor-seeded speaker clustering.
