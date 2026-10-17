@@ -13,6 +13,7 @@ cues at turn pauses (>= 0.35 s) when the speaker changes (ElevenLabs Scribe styl
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import platform
@@ -142,7 +143,13 @@ def cuda_available() -> bool:
 
 
 def _float(pcm: np.ndarray) -> np.ndarray:
-    return pcm.astype(np.float32) / 32768.0 if pcm.dtype.kind == "i" else pcm.astype(np.float32)
+    return pcm.astype(np.float32) * (1.0 / 32768.0) if pcm.dtype.kind == "i" else pcm.astype(np.float32)
+
+
+@functools.lru_cache(maxsize=1)
+def _lid_model():
+    from faster_whisper import WhisperModel
+    return WhisperModel("tiny", device="cpu", compute_type="int8")
 
 
 def detect_language_info(pcm: np.ndarray) -> tuple[str | None, float]:
@@ -155,10 +162,13 @@ def detect_language_info(pcm: np.ndarray) -> tuple[str | None, float]:
     clip = _float(pcm[start:start + 30 * SR])
     if len(clip) < SR:
         clip = _float(pcm[:30 * SR])
-    _, info = WhisperModel("tiny", device="cpu", compute_type="int8").transcribe(clip, beam_size=1)
+    wm = _lid_model() if getattr(WhisperModel, "__module__", "").startswith("faster_whisper") else WhisperModel("tiny", device="cpu", compute_type="int8")
+    if hasattr(wm, "detect_language"):
+        lang, prob, _ = wm.detect_language(clip)
+        return lang, float(prob or 0.0)
+    _, info = wm.transcribe(clip, beam_size=1)
     prob = float(getattr(info, "language_probability", 1.0) or 0.0)
     return getattr(info, "language", None), prob
-
 
 def detect_language(pcm: np.ndarray, min_prob: float = 0.65) -> str | None:
     """Return the detected ISO 639-1 language code when confidence >= min_prob, else None
@@ -226,12 +236,24 @@ def transcribe(
     return res
 
 
+def _join_words(ws: list[Word]) -> str:
+    out: list[str] = []
+    for w in ws:
+        s = w.text.strip()
+        if not s:
+            continue
+        if out and not (ord(s[0]) > 0x2E80 and ord(out[-1][-1]) > 0x2E80):
+            out.append(" " + s)
+        else:
+            out.append(s)
+    return "".join(out)
+
+
 def diarize_cues(pcm: np.ndarray, cues: list[Cue], turn_gap: float = 0.35, thr: float = 0.6) -> tuple[list[Cue], list[str | None]]:
     """ElevenLabs Scribe-style speaker attribution:
     1. When cues carry timed `words`, split cues at internal pauses >= `turn_gap` where the
        speaker changes, and attach `speaker` ('A', 'B', ...) to every `Word` and `Cue`.
     2. Otherwise, embed each cue span and attach `speaker` per cue."""
-    # First check if any cue has word-level timestamps spanning multiple sub-turns across pauses.
     sub_cues: list[Cue] = []
     for c in cues:
         if len(c.words) >= 4:
@@ -244,12 +266,11 @@ def diarize_cues(pcm: np.ndarray, cues: list[Cue], turn_gap: float = 0.35, thr: 
                     turns[-1].append(w)
             if len(turns) > 1 and all(t[-1].end - t[0].start >= 0.8 for t in turns):
                 for t in turns:
-                    sub_cues.append(Cue(t[0].start, t[-1].end, "".join(w.text for w in t).strip(), words=list(t)))
+                    sub_cues.append(Cue(t[0].start, t[-1].end, _join_words(t), words=list(t)))
                 continue
         sub_cues.append(c)
 
     who = speakers.voices(pcm, [(c.start, c.end) for c in sub_cues], thr=thr)
-    # Merge back adjacent sub-cues that ended up with the same speaker and came from no sentence break.
     merged: list[Cue] = []
     merged_who: list[str | None] = []
     for c, spk in zip(sub_cues, who):
@@ -277,10 +298,217 @@ def _mlx_lean() -> None:
     mx.set_cache_limit(0)
 
 
+def parakeet_tokens_to_words(tokens: list) -> list[tuple[float, float, str]]:
+    """Merge Parakeet SentencePiece/BPE subword tokens into whole words with a leading space
+    so `words_to_cues` splits at natural sentence/clause boundaries and never mid-token or before a comma."""
+    words: list[list] = []
+    for t in tokens:
+        piece = str(t["text"] if isinstance(t, dict) else getattr(t, "text", ""))
+        if not piece:
+            continue
+        s = float(t["start"] if isinstance(t, dict) else getattr(t, "start", 0.0))
+        e = float(t["end"] if isinstance(t, dict) else getattr(t, "end", s))
+        if piece.startswith(" ") or not words:
+            w = piece.lstrip(" ")
+            if w:
+                words.append([s, max(e, s + 0.02), " " + w])
+        else:
+            words[-1][1] = max(words[-1][1], e)
+            words[-1][2] += piece
+    return [(round(s, 2), round(e, 2), w) for s, e, w in words if w.strip()]
+
+
+@functools.lru_cache(maxsize=1)
+def _parakeet_model(repo: str):
+    from parakeet_mlx import from_pretrained
+    return from_pretrained(repo)
+
+
+def _decode_tdt_fast(m, features, lengths, offset: float = 0.0, win: int = 8) -> list:
+    """Compiled speculative TDT greedy decoder (bit-for-bit identical to ParakeetTDT.decode_greedy):
+    1. Pre-projects `m.joint.enc(features)` once per chunk on GPU and drops `features`.
+    2. Caches `m.decoder` + `m.joint.pred` across blank frames (where `last_token` is unchanged).
+    3. Evaluates a fixed `win`-frame lookahead window via `@mx.compile` and skips the 8,193-class
+       softmax entropy computation (`confidence` is unused downstream), stepping through runs of
+       consecutive blank frames in pure Python with zero extra Metal synchronizations."""
+    import mlx.core as mx
+    from parakeet_mlx.alignment import AlignedToken
+
+    vocab_len = len(m.vocabulary)
+    durations = m.durations
+    max_symbols = m.max_symbols
+    time_ratio = m.time_ratio
+    act = m.joint.joint_net[0]
+    out_proj = m.joint.joint_net[2]
+
+    kernels = getattr(m, "_siftasr_tdt_kernels", None)
+    if kernels is None:
+        @mx.compile
+        def step_with_dec(tok, h, c, enc_win):
+            dec_out, (nh, nc) = m.decoder(tok, (h, c))
+            dec_out = dec_out.astype(enc_win.dtype)
+            nh = nh.astype(enc_win.dtype)
+            nc = nc.astype(enc_win.dtype)
+            pred_proj = m.joint.pred(dec_out)[0, 0]
+            logits = out_proj(act(enc_win + pred_proj))
+            return (
+                mx.argmax(logits[:, : vocab_len + 1], axis=-1),
+                mx.argmax(logits[:, vocab_len + 1 :], axis=-1),
+                nh,
+                nc,
+                pred_proj,
+            )
+
+        @mx.compile
+        def step_joint_only(pred_proj, enc_win):
+            logits = out_proj(act(enc_win + pred_proj))
+            return (
+                mx.argmax(logits[:, : vocab_len + 1], axis=-1),
+                mx.argmax(logits[:, vocab_len + 1 :], axis=-1),
+            )
+
+        vocab_pieces = tuple(w.replace("\u2581", " ") for w in m.vocabulary)
+        kernels = (step_with_dec, step_joint_only, vocab_pieces)
+        try:
+            setattr(m, "_siftasr_tdt_kernels", kernels)
+        except Exception:
+            pass
+    step_with_dec, step_joint_only, vocab_pieces = kernels
+
+    enc_all = m.joint.enc(features)
+    mx.eval(enc_all)
+    mx.set_cache_limit(48 * 1024 * 1024)
+    hypothesis: list = []
+    try:
+        length = int(lengths[0])
+        enc_b = mx.pad(enc_all[0, :length], [(0, win), (0, 0)])
+        mx.eval(enc_b)
+        step = 0
+        new_symbols = 0
+        last_tok = None
+        hid = None
+        need_dec = True
+        pred_proj = None
+        dec_hid = None
+        while step < length:
+            enc_win = enc_b[step : step + win]
+            if need_dec:
+                if last_tok is None:
+                    dec_out, (nh, nc) = m.decoder(None, None)
+                    dec_out = dec_out.astype(enc_b.dtype)
+                    dec_hid = (nh.astype(enc_b.dtype), nc.astype(enc_b.dtype))
+                    pred_proj = m.joint.pred(dec_out)[0, 0]
+                    pred_arr, dec_arr = step_joint_only(pred_proj, enc_win)
+                    mx.eval(pred_arr, dec_arr, pred_proj, dec_hid[0], dec_hid[1])
+                else:
+                    tok = mx.array([[last_tok]], dtype=mx.int32)
+                    pred_arr, dec_arr, nh, nc, pred_proj = step_with_dec(tok, hid[0], hid[1], enc_win)
+                    dec_hid = (nh, nc)
+                    mx.eval(pred_arr, dec_arr, pred_proj, nh, nc)
+                need_dec = False
+            else:
+                pred_arr, dec_arr = step_joint_only(pred_proj, enc_win)
+                mx.eval(pred_arr, dec_arr)
+            preds = pred_arr.tolist()
+            decs = dec_arr.tolist()
+            w_start = step
+            w_end = min(step + win, length)
+            while step < w_end:
+                idx = step - w_start
+                pred_token = preds[idx]
+                decision = decs[idx]
+                dur = durations[decision]
+                if pred_token != vocab_len:
+                    hypothesis.append(
+                        AlignedToken(
+                            pred_token,
+                            start=step * time_ratio + offset,
+                            duration=dur * time_ratio,
+                            confidence=1.0,
+                            text=vocab_pieces[pred_token],
+                        )
+                    )
+                    last_tok = pred_token
+                    hid = dec_hid
+                    need_dec = True
+                    step += dur
+                    new_symbols += 1
+                    if dur != 0:
+                        new_symbols = 0
+                    elif max_symbols is not None and max_symbols <= new_symbols:
+                        step += 1
+                        new_symbols = 0
+                    break
+                step += dur
+                new_symbols += 1
+                if dur != 0:
+                    new_symbols = 0
+                elif max_symbols is not None and max_symbols <= new_symbols:
+                    step += 1
+                    new_symbols = 0
+    finally:
+        mx.set_cache_limit(0)
+        mx.clear_cache()
+    return hypothesis
+
+
 def _parakeet_mlx(pcm: np.ndarray, model: str) -> tuple[list[Cue], str]:
     _mlx_lean()
-    from parakeet_mlx import from_pretrained
-    m = from_pretrained(os.path.expanduser(model))
+    import parakeet_mlx
+    repo = os.path.expanduser(model)
+    from_pre = getattr(parakeet_mlx, "from_pretrained")
+    m = _parakeet_model(repo) if getattr(from_pre, "__module__", "").startswith("parakeet_mlx") else from_pre(repo)
+    if hasattr(m, "preprocessor_config") and hasattr(m, "generate"):
+        import mlx.core as mx
+        from parakeet_mlx import DecodingConfig
+        from parakeet_mlx.alignment import merge_longest_common_subsequence, merge_longest_contiguous
+        from parakeet_mlx.audio import get_logmel
+
+        use_fast_tdt = all(hasattr(m, k) for k in ("encoder", "decoder", "joint", "durations", "vocabulary", "time_ratio"))
+        cfg = DecodingConfig()
+        sr = int(getattr(m.preprocessor_config, "sample_rate", SR))
+        hop = int(getattr(m.preprocessor_config, "hop_length", 160))
+        chunk_s, overlap_s = 150.0, 4.0
+        c_samp, o_samp = int(chunk_s * sr), int(overlap_s * sr)
+        tokens = []
+        for start in range(0, len(pcm), c_samp - o_samp):
+            end = min(start + c_samp, len(pcm))
+            if end - start < hop:
+                break
+            seg = pcm[start:end]
+            ca = mx.array(seg).astype(mx.float32) * (1.0 / 32768.0) if seg.dtype.kind == "i" else mx.array(seg, dtype=mx.float32)
+            mel = get_logmel(ca, m.preprocessor_config)
+            del ca
+            off = start / sr
+            if use_fast_tdt:
+                features, lengths = m.encoder(mel[None] if len(mel.shape) == 2 else mel)
+                del mel
+                mx.eval(features, lengths)
+                chunk_tokens = _decode_tdt_fast(m, features, lengths, offset=off)
+                del features, lengths
+            else:
+                cr = m.generate(mel, decoding_config=cfg)[0]
+                del mel
+                for s in cr.sentences:
+                    for tok in s.tokens:
+                        tok.start += off
+                        tok.end = tok.start + tok.duration
+                chunk_tokens = cr.tokens
+                del cr
+            if tokens:
+                try:
+                    tokens = merge_longest_contiguous(tokens, chunk_tokens, overlap_duration=overlap_s)
+                except RuntimeError:
+                    tokens = merge_longest_common_subsequence(tokens, chunk_tokens, overlap_duration=overlap_s)
+            else:
+                tokens = chunk_tokens
+            mx.clear_cache()
+            if end >= len(pcm):
+                break
+        if tokens:
+            return words_to_cues(parakeet_tokens_to_words(tokens), max_len=8.0, gap=0.8), model
+        return [], model
+
     with tempfile.NamedTemporaryFile(suffix=".wav") as f:
         with wave.open(f.name, "wb") as w:
             w.setnchannels(1)
@@ -288,17 +516,10 @@ def _parakeet_mlx(pcm: np.ndarray, model: str) -> tuple[list[Cue], str]:
             w.setframerate(SR)
             w.writeframes(pcm.astype(np.int16).tobytes())
         r = m.transcribe(f.name, chunk_duration=120.0, overlap_duration=15.0)
-    cues: list[Cue] = []
-    for s in r.sentences:
-        txt = s.text.strip()
-        if not txt:
-            continue
-        toks = getattr(s, "tokens", None) or []
-        ws = [Word(float(t.start), float(t.end), str(t.text)) for t in toks if getattr(t, "text", "").strip()]
-        cues.append(Cue(float(s.start), float(s.end), txt, words=ws))
-    return cues, model
-
-
+    tokens = [t for s in r.sentences for t in (getattr(s, "tokens", None) or [])]
+    if tokens:
+        return words_to_cues(parakeet_tokens_to_words(tokens), max_len=8.0, gap=0.8), model
+    return [Cue(float(s.start), float(s.end), s.text.strip()) for s in r.sentences if s.text.strip()], model
 def _qwen3_mlx(pcm: np.ndarray, model: str, language: str | None) -> tuple[list[Cue], str]:
     """Chinese / code-switched speech on Apple Silicon via mlx-qwen3-asr, chunked at quiet points
     with explicit language per chunk so a silent intro never poisons later chunks (mlx-audio #928)."""
@@ -372,13 +593,16 @@ def split_quiet(x: np.ndarray, chunk_s: float, search_s: float = 5.0) -> list[tu
     out, start = [], 0
     while len(x) - start > n:
         lo = start + n - search
-        energy = np.convolve(x[lo:start + n].astype(np.float64) ** 2, np.ones(win), mode="valid")
+        seg = x[lo:start + n].astype(np.float64)
+        cs = np.empty(len(seg) + 1, dtype=np.float64)
+        cs[0] = 0.0
+        np.cumsum(seg * seg, out=cs[1:])
+        energy = cs[win:] - cs[:-win]
         cut = lo + int(np.argmin(energy)) + win // 2
         out.append((start, x[start:cut]))
         start = cut
     out.append((start, x[start:]))
     return out
-
 
 def ctc_words(best: np.ndarray, pieces: list[str], offset: float = 0.0) -> list[tuple[float, float, str]]:
     """Greedy CTC path (one unit per 40 ms frame) -> timed words. Unit 0 is blank, 1 unknown;
@@ -439,6 +663,50 @@ def _quan_coreml(pcm: np.ndarray) -> tuple[list[Cue], str]:
     return words_to_cues(words), f"{QUAN_REPO}@{QUAN_REV[:7]}"
 
 
+_END_PUNCT_SUFFIXES = (".", "?", "!", "。", "？", "！", '."', '?"', '!"', ".)", "?)", "!)")
+
+
+def fold_short_cues(
+    cues: list[Cue], min_dur: float = 1.0, max_merged: float = 10.0, max_gap: float = 2.5
+) -> list[Cue]:
+    """Fold 1-2 word micro-orphan cues (< 1.0 s) produced by mid-sentence pauses into their
+    adjacent sentence cue when the merged cue stays <= `max_merged` seconds."""
+    if len(cues) < 2:
+        return cues
+    out: list[Cue] = []
+    i = 0
+    while i < len(cues):
+        c = cues[i]
+        dur = c.end - c.start
+        if (dur < min_dur and len(c.words) <= 2
+                and not c.text.endswith(_END_PUNCT_SUFFIXES) and i + 1 < len(cues)):
+            nxt = cues[i + 1]
+            if nxt.start - c.end <= max_gap and nxt.end - c.start <= max_merged:
+                cues[i + 1] = Cue(
+                    c.start,
+                    nxt.end,
+                    f"{c.text} {nxt.text}".strip(),
+                    words=(c.words or []) + (nxt.words or []),
+                )
+                i += 1
+                continue
+        if (out and not out[-1].text.endswith(_END_PUNCT_SUFFIXES)
+                and dur < min_dur and len(c.words) <= 2):
+            prev = out[-1]
+            if c.start - prev.end <= max_gap and c.end - prev.start <= max_merged:
+                out[-1] = Cue(
+                    prev.start,
+                    c.end,
+                    f"{prev.text} {c.text}".strip(),
+                    words=(prev.words or []) + (c.words or []),
+                )
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return out
+
+
 def words_to_cues(words: list[tuple[float, float, str]], max_len: float = 8.0, gap: float = 0.6) -> list[Cue]:
     """Group timed words into sentence-sized cues: break after . ? !, at a
     pause longer than `gap`, or before a cue passes `max_len` seconds."""
@@ -446,7 +714,7 @@ def words_to_cues(words: list[tuple[float, float, str]], max_len: float = 8.0, g
     cur: list[tuple[float, float, str]] = []
 
     def emit(ws: list[tuple[float, float, str]]) -> None:
-        w_objs = [Word(float(a), float(b), t) for a, b, t in ws]
+        w_objs = [Word(float(a), float(b), t.strip()) for a, b, t in ws if t.strip()]
         cues.append(Cue(float(ws[0][0]), float(ws[-1][1]), "".join(x[2] for x in ws).strip(), words=w_objs))
 
     for w in words:
@@ -477,18 +745,20 @@ def words_to_cues(words: list[tuple[float, float, str]], max_len: float = 8.0, g
             cur = []
     if cur:
         emit(cur)
-    return [c for c in cues if c.text]
+    return fold_short_cues([c for c in cues if c.text])
 
 
 def decode_audio(path: str | Path, sr: int = SR) -> np.ndarray:
-    """Decode any audio/video file to mono int16 PCM via ffmpeg."""
-    out = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"],
-        capture_output=True,
-        check=True,
-    ).stdout
-    return np.frombuffer(out, np.int16)
-
+    """Decode any audio/video file to mono int16 PCM via ffmpeg into a single allocation."""
+    with tempfile.TemporaryFile() as tmp:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"],
+            stdout=tmp,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        tmp.seek(0)
+        return np.fromfile(tmp, dtype=np.int16)
 
 def remote(
     pcm: np.ndarray,
